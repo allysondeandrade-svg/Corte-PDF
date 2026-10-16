@@ -167,9 +167,7 @@ async function handleFile(file) {
     console.error('Erro ao abrir PDF:', err);
     alert('Erro ao carregar o arquivo PDF: ' + err.message);
   }
-}
-
-// Automatic Edge & Label Detection
+}// Automatic Edge & Label Detection
 async function runDetection() {
   state.detectedLabels = [];
   const pages = state.pdfDoc.getPages();
@@ -177,26 +175,31 @@ async function runDetection() {
   let sampleW = 0, sampleH = 0;
 
   for (let pIdx = 0; pIdx < pages.length; pIdx++) {
-    const page = pages[pIdx];
     const { width, height } = state.pageDimensions[pIdx];
     let pageLabels = [];
 
     if (state.options.detectionMode === 'auto') {
-      pageLabels = await detectVectorRectangles(page, width, height);
+      // 1. Vector rectangle detection (exact border paths from PDF)
+      pageLabels = await detectVectorRectangles(pIdx, width, height);
+
+      // 2. Fallback to visual canvas border detection (if vectors didn't find any borders)
+      if (pageLabels.length === 0) {
+        pageLabels = await detectCanvasBorders(pIdx, width, height);
+      }
     }
 
-    // If auto detected nothing or grid mode selected, fallback to Grid A4
+    // 3. Fallback to dynamic orientation-aware grid if still empty or in grid mode
     if (pageLabels.length === 0 || state.options.detectionMode === 'grid') {
-      pageLabels = await detectA4GridCells(pIdx, width, height);
+      pageLabels = await detectDynamicGrid(pIdx, width, height);
     }
 
-    // Sort labels top-to-bottom, left-to-right
+    // Sort labels in natural reading order: top-to-bottom, left-to-right
     pageLabels.sort((a, b) => {
-      // In PDF coordinates, y=0 is bottom. Convert to top-down for sorting:
+      // In PDF coordinates, y=0 is bottom. Distance from top:
       const topA = height - (a.y + a.h);
       const topB = height - (b.y + b.h);
-      const rowA = Math.round(topA / 25);
-      const rowB = Math.round(topB / 25);
+      const rowA = Math.round(topA / 20);
+      const rowB = Math.round(topB / 20);
       if (rowA !== rowB) return rowA - rowB;
       return a.x - b.x;
     });
@@ -223,124 +226,384 @@ async function runDetection() {
   }
 }
 
-// Vector Detection via decompressed 're' operators
-async function detectVectorRectangles(page, width, height) {
+// 1. High-accuracy Vector Detection using PDF.js Operator List
+async function detectVectorRectangles(pageIndex, pageWidth, pageHeight) {
+  if (!state.pdfjsDoc) return [];
   const rects = [];
+  const hLines = [];
+  const vLines = [];
+
   try {
-    const contents = page.node.Contents();
-    if (!contents) return rects;
+    const jsPage = await state.pdfjsDoc.getPage(pageIndex + 1);
+    const ops = await jsPage.getOperatorList();
+    const pdfjs = window.pdfjsLib;
+    const RECT_OP = pdfjs.OPS.rectangle;
+    const CONSTRUCT_PATH = pdfjs.OPS.constructPath;
+    const TRANSFORM_OP = pdfjs.OPS.transform;
+    const SAVE_OP = pdfjs.OPS.save;
+    const RESTORE_OP = pdfjs.OPS.restore;
 
-    let streamBytes = null;
-    if (contents.asUint8Array) {
-      streamBytes = contents.asUint8Array();
+    // Track transformation matrix stack
+    let matrixStack = [[1, 0, 0, 1, 0, 0]];
+    function multiplyMatrix(m1, m2) {
+      return [
+        m1[0] * m2[0] + m1[2] * m2[1],
+        m1[1] * m2[0] + m1[3] * m2[1],
+        m1[0] * m2[2] + m1[2] * m2[3],
+        m1[1] * m2[2] + m1[3] * m2[3],
+        m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
+        m1[1] * m2[4] + m1[3] * m2[5] + m1[5]
+      ];
+    }
+    function applyTransform(x, y, m) {
+      return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
     }
 
-    if (!streamBytes) return rects;
+    for (let i = 0; i < ops.fnArray.length; i++) {
+      const fn = ops.fnArray[i];
+      const args = ops.argsArray[i];
+      let curM = matrixStack[matrixStack.length - 1];
 
-    let text = '';
-    // Try native DecompressionStream if available
-    if (typeof DecompressionStream !== 'undefined') {
-      try {
-        const ds = new DecompressionStream('deflate');
-        const writer = ds.writable.getWriter();
-        writer.write(streamBytes);
-        writer.close();
-        
-        const reader = ds.readable.getReader();
-        const chunks = [];
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          chunks.push(value);
+      if (fn === SAVE_OP) {
+        matrixStack.push([...curM]);
+      } else if (fn === RESTORE_OP) {
+        if (matrixStack.length > 1) matrixStack.pop();
+      } else if (fn === TRANSFORM_OP) {
+        matrixStack[matrixStack.length - 1] = multiplyMatrix(curM, args);
+      } else if (fn === RECT_OP) {
+        const [rx, ry, rw, rh] = args;
+        const [x1, y1] = applyTransform(rx, ry, curM);
+        const [x2, y2] = applyTransform(rx + rw, ry + rh, curM);
+        rects.push({
+          x: Math.min(x1, x2),
+          y: Math.min(y1, y2),
+          w: Math.abs(x2 - x1),
+          h: Math.abs(y2 - y1)
+        });
+      } else if (fn === CONSTRUCT_PATH) {
+        const pathOps = args[0];
+        const pathArgs = args[1];
+        let argIdx = 0;
+        let poly = [];
+
+        for (const pOp of pathOps) {
+          if (pOp === RECT_OP) {
+            const rx = pathArgs[argIdx];
+            const ry = pathArgs[argIdx + 1];
+            const rw = pathArgs[argIdx + 2];
+            const rh = pathArgs[argIdx + 3];
+            const [x1, y1] = applyTransform(rx, ry, curM);
+            const [x2, y2] = applyTransform(rx + rw, ry + rh, curM);
+            rects.push({
+              x: Math.min(x1, x2),
+              y: Math.min(y1, y2),
+              w: Math.abs(x2 - x1),
+              h: Math.abs(y2 - y1)
+            });
+            argIdx += 4;
+          } else if (pOp === 13) { // moveTo
+            const [px, py] = applyTransform(pathArgs[argIdx], pathArgs[argIdx + 1], curM);
+            poly = [[px, py]];
+            argIdx += 2;
+          } else if (pOp === 14) { // lineTo
+            const [px, py] = applyTransform(pathArgs[argIdx], pathArgs[argIdx + 1], curM);
+            if (poly.length > 0) {
+              const prev = poly[poly.length - 1];
+              if (Math.abs(prev[1] - py) < 1.5 && Math.abs(prev[0] - px) > 40) {
+                hLines.push({ y: (prev[1] + py) / 2, x0: Math.min(prev[0], px), x1: Math.max(prev[0], px) });
+              } else if (Math.abs(prev[0] - px) < 1.5 && Math.abs(prev[1] - py) > 40) {
+                vLines.push({ x: (prev[0] + px) / 2, y0: Math.min(prev[1], py), y1: Math.max(prev[1], py) });
+              }
+            }
+            poly.push([px, py]);
+            argIdx += 2;
+          } else if (pOp === 18) { // closePath
+            if (poly.length >= 4 && poly.length <= 6) {
+              const xs = poly.map(pt => pt[0]);
+              const ys = poly.map(pt => pt[1]);
+              const minX = Math.min(...xs);
+              const maxX = Math.max(...xs);
+              const minY = Math.min(...ys);
+              const maxY = Math.max(...ys);
+              rects.push({ x: minX, y: minY, w: maxX - minX, h: maxY - minY });
+            }
+            poly = [];
+          } else if (pOp === 15) {
+            argIdx += 6;
+          } else if (pOp === 16 || pOp === 17) {
+            argIdx += 4;
+          }
         }
-        const total = new Uint8Array(chunks.reduce((acc, c) => acc + c.length, 0));
-        let offset = 0;
-        for (const c of chunks) {
-          total.set(c, offset);
-          offset += c.length;
-        }
-        text = new TextDecoder('latin1').decode(total);
-      } catch (e) {
-        // Fallback to raw text if not compressed
-        text = new TextDecoder('latin1').decode(streamBytes);
       }
-    } else {
-      text = new TextDecoder('latin1').decode(streamBytes);
     }
 
-    // Regex for 're' (rectangle) operator: x y w h re
-    const reRegex = /(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+re/g;
-    let match;
-    while ((match = reRegex.exec(text)) !== null) {
-      const x = parseFloat(match[1]);
-      const y = parseFloat(match[2]);
-      const w = parseFloat(match[3]);
-      const h = parseFloat(match[4]);
-
-      // Filter out whole-page borders or tiny elements like barcode lines
-      if (w > 80 && h > 80 && w < (width - 10) && h < (height - 10)) {
-        // Group duplicates if very close (inner vs outer border stroke)
-        const isDuplicate = rects.some(r => Math.abs(r.x - x) < 4 && Math.abs(r.y - y) < 4);
-        if (!isDuplicate) {
-          rects.push({ x, y, w, h });
+    // Also check if intersecting line strokes form rectangles (e.g. grid outlines)
+    if (rects.length === 0 && hLines.length >= 2 && vLines.length >= 2) {
+      const yCoords = Array.from(new Set(hLines.map(l => Math.round(l.y)))).sort((a, b) => a - b);
+      const xCoords = Array.from(new Set(vLines.map(l => Math.round(l.x)))).sort((a, b) => a - b);
+      for (let i = 0; i < xCoords.length - 1; i++) {
+        for (let j = 0; j < yCoords.length - 1; j++) {
+          const w = xCoords[i + 1] - xCoords[i];
+          const h = yCoords[j + 1] - yCoords[j];
+          if (w >= 60 && h >= 50) {
+            rects.push({ x: xCoords[i], y: yCoords[j], w, h });
+          }
         }
       }
     }
+
+    // Filter rects according to label size criteria (not tiny icons, not full page)
+    let candidates = rects.filter(r => 
+      r.w >= 60 && 
+      r.h >= 50 && 
+      r.w <= (pageWidth - 8) && 
+      r.h <= (pageHeight - 8)
+    );
+
+    // Deduplicate close concentric or twin stroke paths
+    const unique = [];
+    for (const c of candidates) {
+      if (!unique.some(u => 
+        Math.abs(u.x - c.x) < 7 && 
+        Math.abs(u.y - c.y) < 7 && 
+        Math.abs(u.w - c.w) < 7 && 
+        Math.abs(u.h - c.h) < 7
+      )) {
+        unique.push(c);
+      }
+    }
+
+    // Keep outermost borders (discard inner sections/barcodes enclosed inside a larger label)
+    const outermost = unique.filter(c => {
+      return !unique.some(other => 
+        other !== c &&
+        c.x >= other.x - 3 &&
+        c.y >= other.y - 3 &&
+        (c.x + c.w) <= (other.x + other.w + 3) &&
+        (c.y + c.h) <= (other.y + other.h + 3) &&
+        (other.w * other.h) > (c.w * c.h * 1.15)
+      );
+    });
+
+    return outermost;
   } catch (err) {
     console.warn('Erro na detecção vetorial:', err);
+    return [];
   }
-  return rects;
 }
 
-// Grid Detection (A4 Standard 2x5 or dynamic grid)
-async function detectA4GridCells(pageIndex, pageWidth, pageHeight) {
-  const xDivs = [0.0, pageWidth * (271.3 / 595.28), pageWidth];
-  const yRatios = [0.0, 159.79, 314.36, 468.93, 623.50, 841.89].map(y => y / 841.89);
-  const yDivs = yRatios.map(r => r * pageHeight);
+// 2. Visual Canvas Border Detection (Fallback for raster or embedded label borders)
+async function detectCanvasBorders(pageIndex, pageWidth, pageHeight) {
+  try {
+    const jsPage = await state.pdfjsDoc.getPage(pageIndex + 1);
+    const scale = 1.0;
+    const vp = jsPage.getViewport({ scale });
+    const offCanvas = document.createElement('canvas');
+    offCanvas.width = vp.width;
+    offCanvas.height = vp.height;
+    const ctx = offCanvas.getContext('2d', { willReadFrequently: true });
+    
+    await jsPage.render({ canvasContext: ctx, viewport: vp }).promise;
+    
+    const imgData = ctx.getImageData(0, 0, offCanvas.width, offCanvas.height);
+    const data = imgData.data;
+    const w = offCanvas.width;
+    const h = offCanvas.height;
 
-  const rects = [];
+    const isDark = (x, y) => {
+      const idx = (y * w + x) * 4;
+      const r = data[idx];
+      const g = data[idx + 1];
+      const b = data[idx + 2];
+      const a = data[idx + 3];
+      return a > 120 && (r * 0.299 + g * 0.587 + b * 0.114) < 130;
+    };
 
-  // Check for text content to skip empty slots
+    const minLen = 50;
+    const hSegs = [];
+    const vSegs = [];
+
+    // Horizontal scan
+    for (let y = 10; y < h - 10; y += 3) {
+      let run = -1;
+      for (let x = 10; x < w - 10; x++) {
+        if (isDark(x, y)) {
+          if (run === -1) run = x;
+        } else {
+          if (run !== -1) {
+            if ((x - run) >= minLen) hSegs.push({ y, x0: run, x1: x });
+            run = -1;
+          }
+        }
+      }
+      if (run !== -1 && (w - 10 - run) >= minLen) hSegs.push({ y, x0: run, x1: w - 10 });
+    }
+
+    // Vertical scan
+    for (let x = 10; x < w - 10; x += 3) {
+      let run = -1;
+      for (let y = 10; y < h - 10; y++) {
+        if (isDark(x, y)) {
+          if (run === -1) run = y;
+        } else {
+          if (run !== -1) {
+            if ((y - run) >= minLen) vSegs.push({ x, y0: run, y1: y });
+            run = -1;
+          }
+        }
+      }
+      if (run !== -1 && (h - 10 - run) >= minLen) vSegs.push({ x, y0: run, y1: h - 10 });
+    }
+
+    const detected = [];
+    const tol = 8;
+    for (let i = 0; i < hSegs.length; i++) {
+      const top = hSegs[i];
+      for (let j = i + 1; j < hSegs.length; j++) {
+        const bottom = hSegs[j];
+        const bh = bottom.y - top.y;
+        if (bh < minLen) continue;
+        if (Math.abs(top.x0 - bottom.x0) > tol || Math.abs(top.x1 - bottom.x1) > tol) continue;
+
+        const leftX = (top.x0 + bottom.x0) / 2;
+        const rightX = (top.x1 + bottom.x1) / 2;
+        const topY = top.y;
+        const bottomY = bottom.y;
+
+        const hasLeft = vSegs.some(v => Math.abs(v.x - leftX) <= tol && v.y0 <= topY + tol && v.y1 >= bottomY - tol);
+        const hasRight = vSegs.some(v => Math.abs(v.x - rightX) <= tol && v.y0 <= topY + tol && v.y1 >= bottomY - tol);
+
+        if (hasLeft && hasRight) {
+          const pdfX = leftX;
+          const pdfW = rightX - leftX;
+          const pdfH = bottomY - topY;
+          const pdfY = pageHeight - bottomY;
+
+          if (pdfW >= 60 && pdfH >= 50 && pdfW < pageWidth - 10 && pdfH < pageHeight - 10) {
+            detected.push({ x: pdfX, y: pdfY, w: pdfW, h: pdfH });
+          }
+        }
+      }
+    }
+
+    const unique = [];
+    for (const d of detected) {
+      if (!unique.some(u => Math.abs(u.x - d.x) < 8 && Math.abs(u.y - d.y) < 8 && Math.abs(u.w - d.w) < 8 && Math.abs(u.h - d.h) < 8)) {
+        unique.push(d);
+      }
+    }
+    return unique;
+  } catch (e) {
+    console.warn('Erro na detecção visual:', e);
+    return [];
+  }
+}
+
+// 3. Dynamic Orientation-Aware Grid (Pimaco / Custom sheets)
+async function detectDynamicGrid(pageIndex, pageWidth, pageHeight) {
   let textItems = [];
-  if (state.options.skipEmpty && state.pdfjsDoc) {
+  if (state.pdfjsDoc) {
     try {
       const jsPage = await state.pdfjsDoc.getPage(pageIndex + 1);
       const textContent = await jsPage.getTextContent();
-      textItems = textContent.items;
+      textItems = (textContent.items || []).filter(it => it.str && it.str.trim().length > 0);
     } catch (e) {
       textItems = [];
     }
   }
 
-  for (let row = 0; row < 5; row++) {
-    for (let col = 0; col < 2; col++) {
-      const x0 = xDivs[col];
-      const x1 = xDivs[col + 1];
-      // Note: in top-down PDF canvas
-      const topY = yDivs[row];
-      const bottomY = yDivs[row + 1];
+  // If text items exist, group into cluster boxes
+  if (textItems.length >= 4) {
+    const clusters = clusterTextItems(textItems, pageWidth, pageHeight);
+    if (clusters.length > 0) return clusters;
+  }
 
-      // In PDF coordinates (0,0 is bottom-left):
-      const pdfY = pageHeight - bottomY;
-      const w = x1 - x0;
-      const h = bottomY - topY;
+  // Fallback to orientation-aware grid (adapts automatically to landscape vs portrait)
+  const isLandscape = pageWidth > pageHeight;
+  const cols = isLandscape ? 3 : 2;
+  const rows = isLandscape ? 3 : 5;
+  const colW = pageWidth / cols;
+  const rowH = pageHeight / rows;
+
+  const rects = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const x0 = c * colW;
+      const pdfY = (rows - 1 - r) * rowH;
 
       if (state.options.skipEmpty && textItems.length > 0) {
-        // Check if any text item falls inside this cell
         const hasText = textItems.some(item => {
           const itemX = item.transform[4];
           const itemY = item.transform[5];
-          return itemX >= x0 && itemX <= x1 && itemY >= pdfY && itemY <= (pdfY + h);
+          return itemX >= x0 && itemX <= (x0 + colW) && itemY >= pdfY && itemY <= (pdfY + rowH);
         });
-
         if (!hasText) continue;
       }
 
-      rects.push({ x: x0, y: pdfY, w, h });
+      rects.push({ x: x0, y: pdfY, w: colW, h: rowH });
     }
   }
 
   return rects;
+}
+
+// Cluster nearby text bounding boxes into discrete labels
+function clusterTextItems(textItems, pageWidth, pageHeight) {
+  const boxes = textItems.map(it => {
+    const x = it.transform[4];
+    const y = it.transform[5];
+    const w = Math.max(12, it.width || 25);
+    const h = Math.max(8, Math.abs(it.transform[0]) || 12);
+    return { x, y, w, h };
+  });
+
+  const dist = (b1, b2) => {
+    const dx = Math.max(0, Math.max(b1.x - (b2.x + b2.w), b2.x - (b1.x + b1.w)));
+    const dy = Math.max(0, Math.max(b1.y - (b2.y + b2.h), b2.y - (b1.y + b1.h)));
+    return Math.sqrt(dx * dx + dy * dy);
+  };
+
+  const clusters = [];
+  const visited = new Set();
+
+  for (let i = 0; i < boxes.length; i++) {
+    if (visited.has(i)) continue;
+    const cluster = [boxes[i]];
+    visited.add(i);
+    const queue = [boxes[i]];
+
+    while (queue.length > 0) {
+      const curr = queue.shift();
+      for (let j = 0; j < boxes.length; j++) {
+        if (!visited.has(j) && dist(curr, boxes[j]) < 28) {
+          visited.add(j);
+          cluster.push(boxes[j]);
+          queue.push(boxes[j]);
+        }
+      }
+    }
+
+    if (cluster.length >= 2) {
+      const minX = Math.min(...cluster.map(b => b.x));
+      const maxX = Math.max(...cluster.map(b => b.x + b.w));
+      const minY = Math.min(...cluster.map(b => b.y));
+      const maxY = Math.max(...cluster.map(b => b.y + b.h));
+      const cw = maxX - minX;
+      const ch = maxY - minY;
+
+      if (cw >= 60 && ch >= 50 && cw < pageWidth - 10 && ch < pageHeight - 10) {
+        const pad = 8;
+        clusters.push({
+          x: Math.max(0, minX - pad),
+          y: Math.max(0, minY - pad),
+          w: Math.min(pageWidth - minX, cw + pad * 2),
+          h: Math.min(pageHeight - minY, ch + pad * 2)
+        });
+      }
+    }
+  }
+
+  return clusters;
 }
 
 // Render Preview of Current Page
